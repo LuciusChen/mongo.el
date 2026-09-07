@@ -261,16 +261,69 @@ before the peer closed must stay parseable."
         (should (equal (mongodb--choose-auth-mechanism credential hello)
                        (cadr case)))))))
 
+(ert-deftest mongodb-test-scram-sha1-client-proof ()
+  "SHA-1 proofs use MongoDB's :mongo: pre-digest, without SASLprep.
+Expected proofs and signatures were checked independently with Python hashlib
+and hmac, including a password whose non-breaking space SASLprep would change."
+  (dolist (case '(("user" "password" "aeN9oJEydHMWqpeCKF5Zf2k7B6M="
+                   "13aeb492bace543bdada0b647eabe57a50de96bd")
+                  ("dedup1" "p\u00a0ssword密" "bxZpkhMUd+XfsoCIaxnjvIjsRh4="
+                   "f3b8a278a49a6ca7d1efb30de924124bfdc997f4")))
+    (pcase-let* ((`(,user ,password ,proof ,signature) case)
+                 (result (mongodb--scram-client-final
+                          "SCRAM-SHA-1" user password
+                          (format "n=%s,r=fixed" user) "fixed"
+                          "r=fixed-server,s=c2FsdA==,i=4096")))
+      (should (equal (plist-get result :message)
+                     (concat "c=biws,r=fixed-server,p=" proof)))
+      (should (equal (mongodb-bytes-to-hex (plist-get result :server-signature))
+                     signature)))))
+
 (ert-deftest mongodb-test-pbkdf2-known-vectors ()
   "SCRAM PBKDF2 primitives should match published test vectors."
   (should
    (equal (mongodb-bytes-to-hex
-           (mongodb--pbkdf2-hmac-sha1 "password" "salt" 1))
+           (mongodb--pbkdf2 #'mongodb--hmac-sha1 "password" "salt" 1))
           "0c60c80f961f0e71f3a9b524af6012062fe037a6"))
   (should
    (equal (mongodb-bytes-to-hex
-           (mongodb--pbkdf2-hmac-sha256 "password" "salt" 1))
+           (mongodb--pbkdf2 #'mongodb--hmac-sha256 "password" "salt" 1))
           "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b")))
+
+(ert-deftest mongodb-test-pbkdf2-iterations-and-binary-inputs ()
+  "Both digests handle repeated XOR rounds and unibyte keys and salts.
+Expected digests were independently checked with Python hashlib.pbkdf2_hmac."
+  (dolist (case `(("password" "salt" 2
+                   "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957"
+                   "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43")
+                  ("password" "salt" 4096
+                   "4b007901b765489abead49d926f721d065a429c1"
+                   "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a")
+                  ("pass\0word" "sa\0lt" 2
+                   "6e6df5e5f1752bbbd40f5531fe2e1d1d7e9819b2"
+                   "aa4399833b716be66298125c3e643697f19ac0a893c1a93ef0665590c0cde816")
+                  (,(unibyte-string 0 128 255) ,(unibyte-string 254 0 129) 3
+                   "8c1da390e3d2cbeb127a294f6dd25165691c4df9"
+                   "7a26a4077c666be9ba44d66eb32365539518c38ddf34b2429b739c29920def7f")))
+    (pcase-let ((`(,secret ,salt ,iterations ,sha1 ,sha256) case))
+      (should (equal (mongodb-bytes-to-hex
+                      (mongodb--pbkdf2 #'mongodb--hmac-sha1 secret salt iterations)) sha1))
+      (should (equal (mongodb-bytes-to-hex
+                      (mongodb--pbkdf2 #'mongodb--hmac-sha256 secret salt iterations)) sha256)))))
+
+(ert-deftest mongodb-test-pbkdf2-iteration-boundaries ()
+  "Both digests preserve valid limits and structured invalid-count errors."
+  (let ((mongodb-scram-max-iterations 17))
+    (dolist (fn '(mongodb--hmac-sha1 mongodb--hmac-sha256))
+      (dolist (count '(nil -1 0 18 1.5 "3"))
+        (should (equal (should-error (mongodb--pbkdf2 fn "password" "salt" count)
+                                     :type 'mongodb-error)
+                       (list 'mongodb-error
+                             (format "Invalid MongoDB SCRAM iteration count: %S"
+                                     count)))))
+      (dolist (count '(1 2 17))
+        (should (= (length (mongodb--pbkdf2 fn "password" "salt" count))
+                   (if (eq fn 'mongodb--hmac-sha1) 20 32)))))))
 
 (ert-deftest mongodb-test-negative-bson-string-length-is-structured-error ()
   "Malformed BSON string lengths should signal `mongodb-error'."
@@ -454,7 +507,7 @@ is a fixed point."
 (ert-deftest mongodb-test-scram-resource-limits ()
   "SCRAM iteration and continuation work should be bounded."
   (let ((mongodb-scram-max-iterations 1))
-    (should-error (mongodb--pbkdf2-hmac-sha256 "password" "salt" 2)
+    (should-error (mongodb--pbkdf2 #'mongodb--hmac-sha256 "password" "salt" 2)
                   :type 'mongodb-error))
   (let ((mongodb-scram-max-rounds 2)
         (credential (make-mongodb--credential

@@ -1181,53 +1181,25 @@ Arguments: NEGATIVE, COEFFICIENT, EXPONENT."
   "Return SHA-1 digest bytes of DATA."
   (secure-hash 'sha1 (mongodb--byte-string data) nil nil t))
 
-(defun mongodb--pbkdf2-hmac-sha256 (secret salt iterations)
-  "Return PBKDF2-HMAC-SHA-256 for SECRET and SALT.
-The derived key length is SHA-256's 32-byte digest length.
-
-Arguments: SECRET, SALT, ITERATIONS."
+(defun mongodb--pbkdf2 (hmac secret salt iterations)
+  "Derive a SCRAM key from SECRET and SALT using HMAC and ITERATIONS.
+HMAC is a function of key and data.  The derived key is one digest long."
   (unless (and (integerp iterations)
                (> iterations 0)
                (<= iterations mongodb-scram-max-iterations))
     (signal 'mongodb-error
             (list (format "Invalid MongoDB SCRAM iteration count: %S"
                           iterations))))
-  (let* ((u (mongodb--hmac-sha256
+  (let* ((u (funcall hmac
              secret
              (concat (mongodb--byte-string salt)
                      (mongodb--pack-uint32-be 1))))
          (result u))
     (dotimes (_ (1- iterations))
-      (let ((next-u (mongodb--hmac-sha256 secret u)))
+      (let ((next-u (funcall hmac secret u)))
         (setq result (mongodb--xor-bytes result next-u)
               u next-u)))
     result))
-
-(defun mongodb--pbkdf2-hmac-sha1 (secret salt iterations)
-  "Return PBKDF2-HMAC-SHA-1 for SECRET and SALT.
-The derived key length is SHA-1's 20-byte digest length.
-
-Arguments: SECRET, SALT, ITERATIONS."
-  (unless (and (integerp iterations)
-               (> iterations 0)
-               (<= iterations mongodb-scram-max-iterations))
-    (signal 'mongodb-error
-            (list (format "Invalid MongoDB SCRAM iteration count: %S"
-                          iterations))))
-  (let* ((u (mongodb--hmac-sha1
-             secret
-             (concat (mongodb--byte-string salt)
-                     (mongodb--pack-uint32-be 1))))
-         (result u))
-    (dotimes (_ (1- iterations))
-      (let ((next-u (mongodb--hmac-sha1 secret u)))
-        (setq result (mongodb--xor-bytes result next-u)
-              u next-u)))
-    result))
-
-
-
-
 
 (defconst mongodb--op-msg 2013)
 
@@ -1799,7 +1771,7 @@ TIME, when non-nil, supplies the timestamp component."
   (mongodb--utf8-bytes
    (secure-hash 'md5
                 (mongodb--utf8-bytes
-                 (format "%s:mongodb:%s" username secret)))))
+                 (format "%s:mongo:%s" username secret)))))
 
 (defun mongodb--scram-client-nonce ()
   "Return a printable SCRAM client nonce."
@@ -1876,7 +1848,9 @@ values."
                  (<= iterations mongodb-scram-max-iterations))
       (signal 'mongodb-error
               (list "MongoDB SCRAM server message has invalid iteration count")))
-    (let* ((salt (mongodb--base64-decode salt64))
+    (let* ((sha256-p (equal mechanism "SCRAM-SHA-256"))
+           (hmac (if sha256-p #'mongodb--hmac-sha256 #'mongodb--hmac-sha1))
+           (salt (mongodb--base64-decode salt64))
            (client-final-without-proof (format "c=biws,r=%s" server-nonce))
            (auth-message
             (mongodb--utf8-bytes
@@ -1885,35 +1859,25 @@ values."
                               client-final-without-proof)
                         ",")))
            (salted-password
-            (pcase mechanism
-              ("SCRAM-SHA-256"
-               (mongodb--pbkdf2-hmac-sha256
-                (mongodb--scram-password-bytes secret) salt iterations))
-              ("SCRAM-SHA-1"
-               (mongodb--pbkdf2-hmac-sha1
-                (mongodb--scram-sha1-password-bytes username secret)
-                salt iterations))))
+            (mongodb--pbkdf2
+             hmac
+             (if sha256-p
+                 (mongodb--scram-password-bytes secret)
+               (mongodb--scram-sha1-password-bytes username secret))
+             salt iterations))
            (client-key
-            (if (equal mechanism "SCRAM-SHA-256")
-                (mongodb--hmac-sha256 salted-password (mongodb--utf8-bytes "Client Key"))
-              (mongodb--hmac-sha1 salted-password (mongodb--utf8-bytes "Client Key"))))
+            (funcall hmac salted-password (mongodb--utf8-bytes "Client Key")))
            (stored-key
-            (if (equal mechanism "SCRAM-SHA-256")
+            (if sha256-p
                 (mongodb--sha256 client-key)
               (mongodb--sha1 client-key)))
            (client-signature
-            (if (equal mechanism "SCRAM-SHA-256")
-                (mongodb--hmac-sha256 stored-key auth-message)
-              (mongodb--hmac-sha1 stored-key auth-message)))
+            (funcall hmac stored-key auth-message))
            (client-proof (mongodb--xor-bytes client-key client-signature))
            (server-key
-            (if (equal mechanism "SCRAM-SHA-256")
-                (mongodb--hmac-sha256 salted-password (mongodb--utf8-bytes "Server Key"))
-              (mongodb--hmac-sha1 salted-password (mongodb--utf8-bytes "Server Key"))))
+            (funcall hmac salted-password (mongodb--utf8-bytes "Server Key")))
            (server-signature
-            (if (equal mechanism "SCRAM-SHA-256")
-                (mongodb--hmac-sha256 server-key auth-message)
-              (mongodb--hmac-sha1 server-key auth-message))))
+            (funcall hmac server-key auth-message)))
       (list :message
             (format "%s,p=%s" client-final-without-proof
                     (mongodb--base64-encode client-proof))

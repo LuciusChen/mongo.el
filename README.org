@@ -92,6 +92,8 @@ Use explicit BSON wrappers when the wire type matters:
 
 * Tests
 
+Authentication changes must exercise both mechanisms explicitly: run the live test below with authenticated URIs containing =authMechanism=SCRAM-SHA-1= and =authMechanism=SCRAM-SHA-256=, and the correct =authSource=. Use accounts permitted to use the selected mechanism. Default negotiation usually selects SHA-256 and does not validate SHA-1. The deterministic SHA-1 proof test covers MongoDB's legacy =:mongo:= password pre-digest and a Unicode password without applying SHA-256's SASLprep step.
+
 Run unit tests (=load-prefer-newer= keeps a stale =.elc= from shadowing
 edited sources):
 
